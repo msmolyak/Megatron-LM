@@ -40,6 +40,7 @@ from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import make_data_loader
 from megatron.utils import report_memory
 
+import deepspeed
 
 def pretrain(train_valid_test_dataset_provider, model_provider,
              forward_step_func, extra_args_provider=None, args_defaults={}):
@@ -127,6 +128,11 @@ def get_model(model_provider_func):
             mpu.get_model_parallel_rank(),
             sum([p.nelement() for p in model.parameters()])), flush=True)
 
+    # DeepSpeed Integration
+    # To prevent OOM for model sizes that cannot fit in GPU memory in full precision
+    if args.deepspeed and args.fp16:
+        model.half()
+
     # GPU allocation.
     model.cuda(torch.cuda.current_device())
 
@@ -163,8 +169,24 @@ def get_optimizer(model):
             if not hasattr(param, 'model_parallel'):
                 param.model_parallel = False
 
-    # Use Adam.
-    optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+    # DeepSpeed Integration
+    if args.cpu_optimizer:
+        if args.cpu_torch_adam:
+            cpu_adam_optimizer = torch.optim.Adam
+        else:
+            from deepspeed.ops.adam import DeepSpeedCPUAdam
+            cpu_adam_optimizer = DeepSpeedCPUAdam
+        optimizer = cpu_adam_optimizer(param_groups,
+                        lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        # Use FusedAdam.
+        optimizer = Adam(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+
+    print(f'Optimizer = {optimizer.__class__.__name__}')
+    if args.deepspeed:
+        # fp16 wrapper is not required for DeepSpeed.
+        return optimizer
+
 
     # Wrap into fp16 optimizer.
     if args.fp16:
@@ -213,6 +235,19 @@ def setup_model_and_optimizer(model_provider_func):
     optimizer = get_optimizer(model)
     lr_scheduler = get_learning_rate_scheduler(optimizer)
 
+    # DeepSpeed Integration
+    if args.deepspeed:
+        print_rank_0("DeepSpeed is enabled.")
+
+        model, optimizer, _, lr_scheduler = deepspeed.initialize(
+            model=model,
+            optimizer=optimizer,
+            args=args,
+            lr_scheduler=lr_scheduler,
+            mpu=mpu,
+            dist_init_required=False
+        )
+
     if args.load is not None:
         args.iteration = load_checkpoint(model, optimizer, lr_scheduler)
     else:
@@ -237,34 +272,46 @@ def backward_step(optimizer, model, loss):
 
     # Backward pass.
     timers('backward-backward').start()
-    optimizer.zero_grad(set_grads_to_None=True)
-    if args.fp16:
-        optimizer.backward(loss, update_master_grads=False)
+    # DeepSpeed Integration
+    if args.deepspeed:
+        model.backward(loss)
     else:
-        loss.backward()
+        optimizer.zero_grad(set_grads_to_None=True)
+        if args.fp16:
+            optimizer.backward(loss, update_master_grads=False)
+        else:
+            loss.backward()
     timers('backward-backward').stop()
 
-    # All-reduce if needed.
-    if args.DDP_impl == 'local':
-        timers('backward-allreduce').start()
-        model.allreduce_params(reduce_after=False,
-                               fp32_allreduce=args.fp32_allreduce)
-        timers('backward-allreduce').stop()
+    # DeepSpeed Integration
+    if args.deepspeed:
+        # DeepSpeed backward propagation already addressed all reduce communication.
+        # Reset the timer to avoid breaking timer logs below.
+        timers('allreduce').reset()
+    else:
+        # All-reduce if needed.
+        if args.DDP_impl == 'local':
+            timers('backward-allreduce').start()
+            model.allreduce_params(reduce_after=False,
+                                   fp32_allreduce=args.fp32_allreduce)
+            timers('backward-allreduce').stop()
 
     # Update master gradients.
-    timers('backward-master-grad').start()
-    if args.fp16:
-        optimizer.update_master_grads()
-    timers('backward-master-grad').stop()
+    # DeepSpeed Integration
+    if not args.deepspeed:
+        timers('backward-master-grad').start()
+        if args.fp16:
+            optimizer.update_master_grads()
+        timers('backward-master-grad').stop()
 
-    # Clipping gradients helps prevent the exploding gradient.
-    timers('backward-clip-grad').start()
-    if args.clip_grad > 0:
-        if not args.fp16:
-            mpu.clip_grad_norm(model.parameters(), args.clip_grad)
-        else:
-            optimizer.clip_master_grads(args.clip_grad)
-    timers('backward-clip-grad').stop()
+        # Clipping gradients helps prevent the exploding gradient.
+        timers('backward-clip-grad').start()
+        if args.clip_grad > 0:
+            if not args.fp16:
+                mpu.clip_grad_norm(model.parameters(), args.clip_grad)
+            else:
+                optimizer.clip_master_grads(args.clip_grad)
+        timers('backward-clip-grad').stop()
 
 
 def train_step(forward_step_func, data_iterator,
@@ -284,16 +331,20 @@ def train_step(forward_step_func, data_iterator,
     timers('backward').stop()
 
     # Update parameters.
-    timers('optimizer').start()
-    optimizer.step()
-    timers('optimizer').stop()
-
-    # Update learning rate.
     skipped_iter = 0
-    if not (args.fp16 and optimizer.overflow):
-        lr_scheduler.step()
+    timers('optimizer').start()
+    # DeepSpeed Integration
+    if args.deepspeed:
+        model.step()
     else:
-        skipped_iter = 1
+        optimizer.step()
+
+        # Update learning rate.
+        if not (args.fp16 and optimizer.overflow):
+            lr_scheduler.step()
+        else:
+            skipped_iter = 1
+    timers('optimizer').stop()
 
     return loss_reduced, skipped_iter
 
@@ -392,7 +443,8 @@ def train(forward_step_func, model, optimizer, lr_scheduler,
         # Logging.
         loss_scale = None
         if args.fp16:
-            loss_scale = optimizer.loss_scale
+            # DeepSpeed Integration
+            loss_scale = optimizer.cur_scale if args.deepspeed else optimizer.loss_scale
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           optimizer.param_groups[0]['lr'],
                                           iteration, loss_scale,
@@ -446,6 +498,15 @@ def evaluate(forward_step_func, data_iterator, model, verbose=False):
                                                             args.eval_iters))
             # Forward evaluation.
             _, loss_dict = forward_step_func(data_iterator, model)
+
+            # DeepSpeed Integration
+            '''when contiguous memory optimizations are enabled, the buffers
+                        allocated by the optimizations are deallocated during backward pass
+                        in the absence of backward pass the buffers should be reset after each
+                        forward pass'''
+            if args.deepspeed and args.deepspeed_activation_checkpointing:
+                deepspeed.checkpointing.reset()
+
             # Reduce across processes.
             for key in loss_dict:
                 total_loss_dict[key] = total_loss_dict.get(key, 0.) + \

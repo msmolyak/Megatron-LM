@@ -20,6 +20,7 @@ import os
 
 import torch
 from megatron import fused_kernels
+import deepspeed
 
 def parse_args(extra_args_provider=None, defaults={},
                ignore_unknown_args=False):
@@ -44,6 +45,9 @@ def parse_args(extra_args_provider=None, defaults={},
     # Custom arguments.
     if extra_args_provider is not None:
         parser = extra_args_provider(parser)
+
+    # Include DeepSpeed configuration arguments
+    parser = deepspeed.add_config_arguments(parser)
 
     # Parse.
     if ignore_unknown_args:
@@ -180,7 +184,11 @@ def _add_network_size_args(parser):
                        'reasons.')
     group.add_argument('--onnx-safe', type=bool, required=False,
                        help='Use workarounds for known problems with Torch ONNX exporter')
-
+    # DeepSpeed Integration
+    group.add_argument('--cpu-optimizer', action='store_true',
+                       help = 'Run optimizer on CPU')
+    group.add_argument('--cpu_torch_adam', action='store_true',
+                       help = 'Use Torch Adam as optimizer on CPU.')
     return parser
 
 
@@ -215,6 +223,9 @@ def _add_training_args(parser):
                        'across model parallel group.')
     group.add_argument('--checkpoint-num-layers', type=int, default=1,
                        help='chunk size (number of layers) for checkpointing.')
+    # DeepSpeed Integration
+    group.add_argument('--deepspeed-activation-checkpointing', action='store_true',
+                       help='uses activation checkpointing from deepspeed')
     group.add_argument('--train-iters', type=int, default=None,
                        help='Total number of iterations to train over all '
                        'training runs.')
