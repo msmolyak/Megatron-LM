@@ -44,6 +44,8 @@ from .mappings import reduce_from_model_parallel_region
 from .mappings import scatter_to_model_parallel_region
 
 from .random import checkpoint
+# DeepSpeed Integrations
+from .random import partition_activations_in_checkpoint
 from .random import get_cuda_rng_tracker
 from .random import init_checkpointed_activations_memory_buffer
 from .random import model_parallel_cuda_manual_seed

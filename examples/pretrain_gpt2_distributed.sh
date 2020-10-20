@@ -15,6 +15,7 @@ CHECKPOINT_PATH=<Specify path>
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
+# DeepSpeed Integration
 python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        pretrain_gpt2.py \
        --model-parallel-size 1 \
@@ -35,6 +36,7 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --split 949,50,1 \
        --distributed-backend nccl \
        --lr 0.00015 \
+       --no-load-optim \
        --lr-decay-style cosine \
        --min-lr 1.0e-5 \
        --weight-decay 1e-2 \
@@ -45,8 +47,8 @@ python -m torch.distributed.launch $DISTRIBUTED_ARGS \
        --save-interval 10000 \
        --eval-interval 1000 \
        --eval-iters 10 \
-       --fp16
-
+       --fp16 \
+       --deepspeed
 
 
 set +x

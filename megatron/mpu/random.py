@@ -22,7 +22,25 @@ import contextlib
 import torch
 from torch import _C
 from torch.cuda import _lazy_call, device as device_ctx_manager
-from torch.utils.checkpoint import detach_variable
+#from torch.utils.checkpoint import detach_variable
+
+# DeepSpeed Integration
+import torch.distributed as dist
+PARTITION_ACTIVATIONS = False
+PA_CORRECTNESS_TEST= False
+
+def see_memory_usage(message, force=False):
+    if not force:
+        return
+    dist.barrier()
+    if dist.get_rank() == 0:
+        print(message)
+        print("Memory Allocated ", torch.cuda.memory_allocated()/(1024*1024*1024), "GigaBytes")
+        print("Max Memory Allocated ", torch.cuda.max_memory_allocated()/(1024*1024*1024), "GigaBytes")
+        print("Cache Allocated ", torch.cuda.memory_cached()/(1024*1024*1024), "GigaBytes")
+        print("Max cache Allocated ", torch.cuda.max_memory_cached()/(1024*1024*1024), "GigaBytes")
+        print(" ")
+        #input("Press Any Key To Continue ..")
 
 from megatron import get_args
 from megatron.memory import allocate_mem_buff
@@ -32,6 +50,11 @@ from .initialize import get_model_parallel_group
 from .initialize import get_model_parallel_rank
 from .initialize import get_model_parallel_world_size
 
+# DeepSpeed Integration
+mp_rank = None #get_model_parallel_rank()
+mp_size = None #get_model_parallel_world_size()
+mp_group = None #get_model_parallel_group()
+
 
 # Default name for the model parallel rng tracker.
 _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
@@ -39,6 +62,34 @@ _MODEL_PARALLEL_RNG_TRACKER_NAME = 'model-parallel-rng'
 
 # Whether apply model parallelsim to checkpointed hidden states.
 _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER = None
+
+# DeepSpeed Integration
+transport_stream = None
+cuda_device = None
+
+
+def detach_variable(inputs, device=None):
+    if isinstance(inputs, tuple):
+        out = []
+        for inp in inputs:
+            if not isinstance(inp, torch.Tensor):
+                out.append(inp)
+                continue
+
+            requires_grad = inp.requires_grad
+
+            if device is not None:
+                x = inp.to(device=device)
+            else:
+                x = inp
+
+            x = x.detach()
+            x.requires_grad = requires_grad
+            out.append(x)
+        return tuple(out)
+    else:
+        raise RuntimeError(
+            "Only tuple of tensors is supported. Got Unsupported input type: ", type(inputs).__name__)
 
 
 def init_checkpointed_activations_memory_buffer():
@@ -242,6 +293,45 @@ def model_parallel_cuda_manual_seed(seed):
                                 model_parallel_seed)
 
 
+# DeepSpeed Integration
+def get_partition_start(item):
+    global mp_rank, mp_size, mp_group
+    partition_size = get_partition_size(item)
+    start = partition_size * mp_rank
+    return int(start)
+
+
+def get_partition_size(item):
+    global mp_rank, mp_size, mp_group
+    size = item.numel()
+    partition_size = size / mp_size
+    return int(partition_size)
+
+
+def get_full_inputs(tensors):
+    inputs = []
+    for i in range(int(len(tensors) / 2) - 1):
+        item = tensors[2 * i]
+        size = tensors[2 * i + 1]
+        partition_size = item.numel()
+        tensor_size = partition_size * mp_size
+        flat_tensor = torch.zeros([tensor_size], dtype=item.dtype, device=item.device)
+        partitions = []
+        for i in range(mp_size):
+            part_i = flat_tensor.narrow(0, partition_size * i, partition_size)
+            if i == mp_rank:
+                part_i.copy_(item)
+            partitions.append(part_i)
+        dist.all_gather(partitions, partitions[mp_rank], group=mp_group)
+        input_tensor = flat_tensor.view(list(size.numpy()))
+        item.data = input_tensor.data
+
+        inputs.append(item)
+    inputs.append(tensors[-2])
+
+    return tuple(inputs)
+
+
 class CheckpointFunction(torch.autograd.Function):
     """This function is adapted from torch.utils.checkpoint with
        two main changes:
@@ -252,6 +342,31 @@ class CheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, *args):
         ctx.run_function = run_function
+        # DeepSpeed Integration
+        global mp_rank, mp_size, mp_group
+        if mp_rank is None:
+            mp_rank = get_model_parallel_rank()
+            mp_size = get_model_parallel_world_size()
+            mp_group = get_model_parallel_group()
+
+        global cuda_device, transport_stream, PARTITION_ACTIVATIONS
+        if cuda_device is None:
+            if dist.get_rank() == 0:
+                print(f"Partition Activations {PARTITION_ACTIVATIONS} and Correctness Check {PA_CORRECTNESS_TEST}")
+
+            cuda_device = torch.cuda.current_device()
+            # The transport stream is used to overlap the allgather communication for the activations
+            # with the computation in the backward pass
+            transport_stream = torch.cuda.Stream(device=cuda_device)
+
+        if PARTITION_ACTIVATIONS:
+            inputs = [item.detach().contiguous().view(-1).narrow(0, get_partition_start(item),
+                                                                 get_partition_size(item)).clone() for item in
+                      args[:-1]]
+            inputs.append(args[-1])
+
+        # just in case something funky is happening such as reuse of inputs
+        inputs_cuda = [item.to(cuda_device) for item in args]
 
         # Copy the rng states.
         ctx.fwd_cpu_rng_state = torch.get_rng_state()
@@ -259,7 +374,8 @@ class CheckpointFunction(torch.autograd.Function):
         ctx.fwd_cuda_rng_state_tracker = get_cuda_rng_tracker().get_states()
 
         with torch.no_grad():
-            outputs = run_function(*args)
+            # DeepSpeed Integration
+            outputs = run_function(*inputs_cuda)
 
         # Divide hidden states across model parallel group and only keep
         # the chunk corresponding to the current rank.
@@ -270,9 +386,22 @@ class CheckpointFunction(torch.autograd.Function):
                 args[0].data)
             
         # Store everything.
-        ctx.save_for_backward(*args)
+        # ctx.save_for_backward(*args)
 
-            
+        # DeepSpeed Integration
+        del inputs_cuda
+
+        if PARTITION_ACTIVATIONS:
+            new_args = []
+            for arg, inp in zip(args, inputs):
+                size = torch.tensor(arg.size())
+                arg.data = inp.data
+                new_args.append(arg)
+                new_args.append(size)
+            ctx.save_for_backward(*new_args)
+        else:
+            ctx.save_for_backward(*args)
+
         return outputs
 
     @staticmethod
@@ -280,7 +409,17 @@ class CheckpointFunction(torch.autograd.Function):
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError("Checkpointing is not compatible with .grad(), "
                                "please use .backward() if possible")
-        inputs = ctx.saved_tensors
+        # DeepSpeed Integration
+        global cuda_device, transport_stream, PARTITION_ACTIVATIONS
+
+        if PARTITION_ACTIVATIONS:
+            with torch.cuda.stream(transport_stream):
+                inputs = get_full_inputs(ctx.saved_tensors)
+                detached_inputs = detach_variable(inputs)
+        else:
+            inputs = ctx.saved_tensors
+            detached_inputs = detach_variable(inputs)
+
         if _CHECKPOINTED_ACTIVATIONS_MEMORY_BUFFER is not None:
             inputs[0].data = gather_split_1d_tensor(inputs[0].data)
             inputs[0].data = inputs[0].data.view(ctx.input_0_shape)
@@ -294,6 +433,11 @@ class CheckpointFunction(torch.autograd.Function):
         torch.set_rng_state(ctx.fwd_cpu_rng_state)
         _set_cuda_rng_state(ctx.fwd_cuda_rng_state)
         get_cuda_rng_tracker().set_states(ctx.fwd_cuda_rng_state_tracker)
+
+        # DeepSpeed Integration
+        if PARTITION_ACTIVATIONS:
+            current_stream=torch.cuda.current_stream()
+            current_stream.wait_stream(transport_stream)
 
         # Compute the forward pass.
         detached_inputs = detach_variable(inputs)
@@ -317,3 +461,11 @@ def checkpoint(function, *args):
     """Checkpoint a model or part of the model.
     This has been directly copied from torch.utils.checkpoint."""
     return CheckpointFunction.apply(function, *args)
+
+
+# DeepSpeed Integration
+def partition_activations_in_checkpoint(partition_activation):
+    global PARTITION_ACTIVATIONS
+    PARTITION_ACTIVATIONS=partition_activation
+    if dist.get_rank()  == 0:
+        print(f"**************Partition Activations {PARTITION_ACTIVATIONS}************")
