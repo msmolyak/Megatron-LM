@@ -194,6 +194,7 @@ def get_checkpoint_iteration(args):
     return iteration, release, True
 
 
+# DeepSpeed Integration
 def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
     """Load a model checkpoint and return the iteration."""
     args = get_args()
@@ -233,6 +234,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
             print_rank_0('could not load the checkpoint')
             sys.exit()
 
+        # DeepSpeed Integration
         if isinstance(model, torchDDP):
             model = model.module
 

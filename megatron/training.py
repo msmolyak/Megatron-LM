@@ -276,7 +276,7 @@ def backward_step(optimizer, model, loss):
     if args.deepspeed:
         model.backward(loss)
     else:
-        optimizer.zero_grad(set_grads_to_None=True)
+        optimizer.zero_grad()
         if args.fp16:
             optimizer.backward(loss, update_master_grads=False)
         else:
