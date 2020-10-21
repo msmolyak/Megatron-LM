@@ -198,7 +198,6 @@ def get_checkpoint_iteration(args):
 def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
     """Load a model checkpoint and return the iteration."""
     args = get_args()
-    load_dir = getattr(args, load_arg)
 
     iteration, release, success = get_checkpoint_iteration(args)
 
@@ -215,6 +214,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
             return iteration
     else:
         # Checkpoint.
+        load_dir = getattr(args, load_arg)
         checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
         if mpu.get_data_parallel_rank() == 0:
             print('global rank {} is loading checkpoint {}'.format(
