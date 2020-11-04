@@ -164,7 +164,7 @@ def save_ds_checkpoint(iteration, model, args):
 
 def get_checkpoint_iteration(args):
     # Read the tracker file and set the iteration.
-    tracker_filename = get_checkpoint_tracker_filename(load_dir)
+    tracker_filename = get_checkpoint_tracker_filename(args.load)
 
     # If no tracker file, return iretation zero.
     if not os.path.isfile(tracker_filename):
