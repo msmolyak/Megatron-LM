@@ -206,7 +206,7 @@ def load_checkpoint(model, optimizer, lr_scheduler, load_arg='load'):
 
     if args.deepspeed:
 
-        checkpoint_name, sd = model.load_checkpoint(args.load, iteration)
+        checkpoint_name, state_dict = model.load_checkpoint(args.load, iteration)
 
         if checkpoint_name is None:
             if mpu.get_data_parallel_rank() == 0:
