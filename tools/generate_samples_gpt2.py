@@ -31,6 +31,7 @@ from megatron.text_generation_utils import generate_and_write_samples_unconditio
 from megatron.text_generation_utils import generate_samples_input_from_file
 from megatron.text_generation_utils import generate_samples_interactive
 
+import deepspeed
 
 def model_provider():
     """Build the model."""
@@ -81,6 +82,22 @@ def main():
     # Set up model and load checkpoint.
     model = get_model(model_provider)
     args = get_args()
+
+    if args.deepspeed and args.fp16:
+        model.half()
+
+    if args.deepspeed:
+        print_rank_0("DeepSpeed is enabled.")
+
+        model = deepspeed.initialize(
+            model=model,
+            optimizer=None,
+            args=args,
+            lr_scheduler=None,
+            mpu=None,
+            dist_init_required=False
+        )[0]
+
     if args.load is not None:
         _ = load_checkpoint(model, None, None)
 

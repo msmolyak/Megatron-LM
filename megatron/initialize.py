@@ -28,6 +28,8 @@ from megatron import mpu
 from megatron.global_vars import set_global_variables
 from megatron.mpu import set_model_parallel_rank, set_model_parallel_world_size
 
+import deepspeed
+
 def initialize_megatron(extra_args_provider=None, args_defaults={},
                         ignore_unknown_args=False, allow_no_cuda=False):
     """Set global variables, initialize distributed, and
@@ -83,7 +85,29 @@ def initialize_megatron(extra_args_provider=None, args_defaults={},
         _write_args_to_tensorboard()
         # No continuation function
         return None
-        
+
+
+# DeepSpeed Integration
+'''
+    Optional DeepSpeed Activation Checkpointing features
+    Gives access to partition activations, contiguous memory optimizations
+    and cpu checkpointing.
+
+    Activation checkpoint requires keep track of the random states
+    and setting the random seed for each MP process. Megatron uses
+    mpu.get_cuda_rng_tracker and mpu.model_parallel_cuda_manual_seed
+    for keeping track of the random states and setting the random seeds.
+    Since they are used in places outside of activation checkpointing,
+    we overwrite them to maintain consistency.
+
+    This must be done before all the calls to mpu.model_parallel_cuda_manual_seed
+    '''
+def set_deepspeed_activation_checkpointing(args):
+
+    deepspeed.checkpointing.configure(mpu, deepspeed_config=args.deepspeed_config, num_checkpoints=args.num_layers)
+    mpu.checkpoint = deepspeed.checkpointing.checkpoint
+    mpu.get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+    mpu.model_parallel_cuda_manual_seed = deepspeed.checkpointing.model_parallel_cuda_manual_seed
 
 def _initialize_distributed():
     """Initialize torch.distributed and mpu."""
@@ -125,6 +149,11 @@ def _initialize_distributed():
     if device_count > 0:
         mpu.initialize_model_parallel(args.model_parallel_size)
 
+    # DeepSpeed Integration
+    # Optional DeepSpeed Activation Checkpointing Features
+    #
+    if args.deepspeed and args.deepspeed_activation_checkpointing:
+        set_deepspeed_activation_checkpointing(args)
 
 def _init_autoresume():
     """Set autoresume start time."""

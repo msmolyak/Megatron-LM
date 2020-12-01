@@ -27,6 +27,11 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.utils import openai_gelu, erf_gelu
 
+from megatron.mpu import checkpoint
+from megatron.mpu import get_cuda_rng_tracker
+
+import deepspeed
+
 # flags required to enable jit fusion kernels
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -170,6 +175,11 @@ class ParallelSelfAttention(MegatronModule):
             init_method=output_layer_init_method,
             skip_bias_add=True)
 
+        if deepspeed.checkpointing.is_configured():
+            global get_cuda_rng_tracker, checkpoint
+            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+            checkpoint = deepspeed.checkpointing.checkpoint
+
 
     def forward(self, hidden_states, attention_mask, layer_past=None,
                 get_key_value=False):
@@ -270,7 +280,7 @@ class ParallelSelfAttention(MegatronModule):
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
-        with mpu.get_cuda_rng_tracker().fork():
+        with get_cuda_rng_tracker().fork():
             attention_probs = self.attention_dropout(attention_probs)
 
 
@@ -496,6 +506,11 @@ class ParallelTransformer(MegatronModule):
             args.hidden_size,
             eps=args.layernorm_epsilon)
 
+        if deepspeed.checkpointing.is_configured():
+            global get_cuda_rng_tracker, checkpoint
+            get_cuda_rng_tracker = deepspeed.checkpointing.get_cuda_rng_tracker
+            checkpoint = deepspeed.checkpointing.checkpoint
+
     def _get_layer_index(self, layer_number):
         if self.param_sharing_style == 'grouped':
             return layer_number % self.num_unique_layers
@@ -521,7 +536,7 @@ class ParallelTransformer(MegatronModule):
         mpu.reset_checkpointed_activations_memory_buffer()
         l = 0
         while l < self.num_layers:
-            hidden_states = mpu.checkpoint(
+            hidden_states = checkpoint(
                 custom(l, l + self.checkpoint_num_layers),
                 hidden_states, attention_mask)
             l += self.checkpoint_num_layers
